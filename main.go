@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -15,38 +16,46 @@ import (
 const VERSION = "0.0.1"
 
 const (
-	CURSOR_UP = uint16(iota + 1000)
-	CURSOR_DOWN
-	CURSOR_LEFT
-	CURSOR_RIGHT
-	PAGE_UP
-	PAGE_DOWN
-	CTRL_C
-	CTRL_L
-	HOME
-	END
+	CURSOR_UP_KEY = uint16(iota + 1000)
+	CURSOR_DOWN_KEY
+	CURSOR_LEFT_KEY
+	CURSOR_RIGHT_KEY
+	PAGE_UP_KEY
+	DEL_KEY
+	PAGE_DOWN_KEY
+	CTRL_Q_KEY
+	CTRL_L_KEY
+	HOME_KEY
+	END_KEY
 )
 
 type Editor struct {
-	ScreenCols int
-	ScreenRows int
-	CursorX    int
-	CursorY    int
+	ScreenCols  int
+	ScreenRows  int
+	CursorX     int
+	CursorY     int
+	RowOffset   int
+	ColOffset   int
+	RenderRows  []string
+	ContentRows []string
 }
 
 var editor Editor
 
 func main() {
+	flag.Parse()
 	width, height, err := term.GetSize(int(os.Stdin.Fd()))
 	if err != nil {
 		log.Fatalf("failed to get terminal size: %v", err)
 	}
 
 	editor = Editor{
-		ScreenCols: width,
-		ScreenRows: height,
-		CursorX:    0,
-		CursorY:    0,
+		ScreenCols:  width,
+		ScreenRows:  height,
+		CursorX:     0,
+		CursorY:     0,
+		ContentRows: []string{},
+		RowOffset:   0,
 	}
 
 	prevState, err := term.MakeRaw(int(os.Stdin.Fd()))
@@ -54,14 +63,26 @@ func main() {
 		log.Fatalf("failed to switch to raw mode: %v", err)
 	}
 	defer term.Restore(int(os.Stdin.Fd()), prevState)
+
+	args := flag.Args()
+	if len(args) > 0 {
+		fileName := args[0]
+		err := EditorOpen(fileName)
+		if err != nil {
+			log.Printf("error occured while opening the file: %v", err)
+			return
+		}
+	}
+
 	controlChannel := make(chan int, 0)
 	redrawChannel := make(chan int, 0)
 
 	keyChannel := make(chan uint16, 64)
-	go ReadKey(keyChannel)
+	go editor.ReadKey(keyChannel)
 
 	go ProcessKeypress(controlChannel, keyChannel, redrawChannel)
 
+	fmt.Print("\x1b[2J") // clear screen
 	EditorRefreshScreen()
 	go func() {
 		for range redrawChannel {
@@ -76,7 +97,7 @@ func CtrlKey(c byte) byte {
 	return c & 0x1f
 }
 
-func ReadKey(keyChannel chan<- uint16) {
+func (e *Editor) ReadKey(keyChannel chan<- uint16) {
 	reader := bufio.NewReaderSize(os.Stdin, 16)
 	for {
 		b, err := reader.ReadByte()
@@ -85,9 +106,9 @@ func ReadKey(keyChannel chan<- uint16) {
 		}
 		switch b {
 		case CtrlKey('q'):
-			keyChannel <- CTRL_C
+			keyChannel <- CTRL_Q_KEY
 		case CtrlKey('l'):
-			keyChannel <- CTRL_L
+			keyChannel <- CTRL_L_KEY
 		case '\x1b':
 			b1, err := reader.ReadByte()
 			if err == io.EOF {
@@ -107,91 +128,95 @@ func ReadKey(keyChannel chan<- uint16) {
 					if b3 == '~' {
 						switch b2 {
 						case '1':
-							keyChannel <- HOME
+							keyChannel <- HOME_KEY
+						case '3':
+							keyChannel <- DEL_KEY
 						case '4':
-							keyChannel <- END
+							keyChannel <- END_KEY
 						case '5':
-							keyChannel <- PAGE_UP
+							keyChannel <- PAGE_UP_KEY
 						case '6':
-							keyChannel <- PAGE_DOWN
+							keyChannel <- PAGE_DOWN_KEY
 						case '7':
-							keyChannel <- HOME
+							keyChannel <- HOME_KEY
 						case '8':
-							keyChannel <- END
+							keyChannel <- END_KEY
 						}
 					}
 				} else {
 					switch b2 {
 					case 'A':
-						keyChannel <- CURSOR_UP
+						keyChannel <- CURSOR_UP_KEY
 					case 'B':
-						keyChannel <- CURSOR_DOWN
+						keyChannel <- CURSOR_DOWN_KEY
 					case 'C':
-						keyChannel <- CURSOR_RIGHT
+						keyChannel <- CURSOR_RIGHT_KEY
 					case 'D':
-						keyChannel <- CURSOR_LEFT
+						keyChannel <- CURSOR_LEFT_KEY
 					case 'H':
-						keyChannel <- HOME
+						keyChannel <- HOME_KEY
 					case 'F':
-						keyChannel <- END
+						keyChannel <- END_KEY
 					}
 				}
 
 			} else if b1 == 'O' {
 				switch b2 {
 				case 'H':
-					keyChannel <- HOME
+					keyChannel <- HOME_KEY
 				case 'F':
-					keyChannel <- END
+					keyChannel <- END_KEY
 				}
 			}
 		}
 	}
 }
 
-func ConvertKeyPressToKeyCode(keyPressChan <-chan byte, keyCodeChan chan<- int16) {
-}
-
 func ProcessKeypress(controlChannel chan<- int, keyChannel <-chan uint16, redraw chan<- int) {
 	for kp := range keyChannel {
 		switch kp {
-		case CTRL_C:
+		case CTRL_Q_KEY:
 			fmt.Print("\x1b[2J")
 			fmt.Print("\x1b[H")
 			controlChannel <- 0
-		case CTRL_L:
+		case CTRL_L_KEY:
 			EditorRefreshScreen()
-		case CURSOR_LEFT:
-			if editor.CursorX > 0 {
+		case CURSOR_LEFT_KEY:
+			if editor.CursorX != 0 {
 				editor.CursorX--
+			} else if editor.CursorY > 0 {
+				editor.CursorY--
+				editor.CursorX = len(editor.RenderRows[editor.CursorY])
 			}
 			redraw <- 0
-		case CURSOR_DOWN:
-			log.Print("hello")
-			if editor.CursorY < editor.ScreenRows {
+		case CURSOR_DOWN_KEY:
+			if editor.CursorY < len(editor.RenderRows) {
 				editor.CursorY++
 			}
 			redraw <- 0
-		case CURSOR_UP:
+		case CURSOR_UP_KEY:
 			if editor.CursorY > 0 {
 				editor.CursorY--
 			}
 			redraw <- 0
-		case CURSOR_RIGHT:
-			if editor.CursorX < editor.ScreenCols {
+		case CURSOR_RIGHT_KEY:
+			if len(editor.RenderRows) > editor.CursorY && editor.CursorX < len(editor.RenderRows[editor.CursorY]) {
 				editor.CursorX++
+			} else if len(editor.RenderRows) > editor.CursorY && editor.CursorX == len(editor.RenderRows[editor.CursorY]) {
+				editor.CursorY++
+				editor.CursorX = 0
 			}
 			redraw <- 0
-		case PAGE_UP:
+		case PAGE_UP_KEY:
 			editor.CursorY = 0
 			redraw <- 0
-		case PAGE_DOWN:
+		case PAGE_DOWN_KEY:
 			editor.CursorY = editor.ScreenRows - 1
 			redraw <- 0
-		case HOME:
+		case HOME_KEY:
 			editor.CursorX = 0
 			redraw <- 0
-		case END:
+		case END_KEY:
 			editor.CursorX = editor.ScreenCols - 1
 			redraw <- 0
 		}
@@ -199,32 +224,101 @@ func ProcessKeypress(controlChannel chan<- int, keyChannel <-chan uint16, redraw
 }
 
 func EditorRefreshScreen() {
-	fmt.Print("\x1b[?25l\x1b[H")
-	EditorDrawRows()
-	fmt.Printf("\x1b[%d;%dH\x1b[?25h", editor.CursorY+1, editor.CursorX+1)
+	EditorScroll()
+	builder := strings.Builder{}
+	builder.WriteString("\x1b[?25l")
+	builder.WriteString("\x1b[H")
+	EditorDrawRows(&builder)
+	builder.WriteString(fmt.Sprintf("\x1b[%d;%dH", editor.CursorY-editor.RowOffset+1, editor.CursorX-editor.ColOffset+1))
+	builder.WriteString(fmt.Sprintf("\x1b[?25h"))
+
+	fmt.Print(builder.String())
 }
 
-func EditorDrawRows() {
-	builder := strings.Builder{}
-	for i := 0; i < editor.ScreenRows-1; i++ {
-		if i == editor.ScreenRows/3 {
-			welcomeMessage := fmt.Sprintf("Gilo editor -- version %s", VERSION)
-			if len(welcomeMessage) > editor.ScreenCols {
-				welcomeMessage = welcomeMessage[:editor.ScreenCols-1]
-			} else {
-				padding := strings.Builder{}
-				for j := 0; j < (editor.ScreenCols-len(welcomeMessage))/2; j++ {
-					padding.WriteByte(' ')
+func EditorDrawRows(builder *strings.Builder) {
+	for row := 0; row < editor.ScreenRows; row++ {
+		fileRow := row + editor.RowOffset
+		if fileRow >= len(editor.ContentRows) {
+			if len(editor.ContentRows) > 0 && row == editor.ScreenRows/3 {
+				welcomeMessage := fmt.Sprintf("Gilo editor -- version %s", VERSION)
+				if len(welcomeMessage) > editor.ScreenCols {
+					welcomeMessage = welcomeMessage[:editor.ScreenCols]
 				}
-				padding.WriteString(welcomeMessage)
-				padding.Write([]byte("\n\r"))
-				welcomeMessage = padding.String()
+				paddingLength := (editor.ScreenCols - len(welcomeMessage)) / 2
+				if paddingLength > 0 {
+					builder.WriteByte('~')
+					paddingLength--
+				}
+				for paddingLength > 0 {
+					builder.WriteByte(' ')
+					paddingLength--
+				}
+				builder.WriteString(welcomeMessage)
+			} else {
+				builder.WriteByte('~')
 			}
-			builder.WriteString(welcomeMessage)
 		} else {
-			builder.WriteString("~ \x1b[K\r\n")
+			displayLength := len(editor.RenderRows[fileRow]) - editor.ColOffset
+			if displayLength > 0 {
+				if displayLength > editor.ScreenCols {
+					displayLength = editor.ScreenCols
+				}
+				builder.WriteString(editor.RenderRows[fileRow][editor.ColOffset : editor.ColOffset+displayLength])
+			}
 		}
+
+		builder.WriteString("\x1b[K")
+		if row < editor.ScreenRows-1 {
+			builder.WriteString("\r\n")
+		}
+		fmt.Print(builder.String())
 	}
-	builder.WriteString("~ \x1b[K")
-	fmt.Print(builder.String())
+}
+
+func EditorOpen(fileName string) error {
+	file, err := os.Open(fileName)
+	if err != nil {
+		return fmt.Errorf("failed to open the file: %w", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	numberOfLines := 0
+	for scanner.Scan() {
+		editor.ContentRows = append(editor.ContentRows, scanner.Text())
+		editor.RenderRows = append(editor.RenderRows, RenderText(scanner.Text()))
+		numberOfLines++
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("failed to read file content: %w", err)
+	}
+
+	return nil
+}
+
+func EditorScroll() {
+	if editor.CursorY < editor.RowOffset {
+		editor.RowOffset = editor.CursorY
+	}
+	if editor.CursorY >= editor.RowOffset+editor.ScreenRows {
+		editor.RowOffset = editor.CursorY - editor.ScreenRows + 1
+	}
+	if editor.CursorX < editor.ColOffset {
+		editor.ColOffset = editor.CursorX
+	}
+	if editor.CursorX >= editor.ColOffset+editor.ScreenCols {
+		editor.ColOffset = editor.CursorX - editor.ScreenCols + 1
+	}
+	rowLength := 0
+	if editor.CursorY < len(editor.RenderRows) {
+		rowLength = len(editor.RenderRows[editor.CursorY])
+	}
+	if editor.CursorX > rowLength {
+		editor.CursorX = rowLength
+	}
+}
+
+func RenderText(text string) string {
+	return strings.ReplaceAll(text, "\t", "   ")
 }
